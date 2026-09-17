@@ -1,0 +1,13 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Comma-separated list of origins allowed to call this API from a
+      # browser (e.g. the Vercel deployment URL). Falls back to localhost
+      # for local dev if unset.
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000}
+    restart: unless-stopped

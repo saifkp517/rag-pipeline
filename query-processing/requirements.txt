@@ -1,0 +1,16 @@
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+python-multipart==0.0.32
+python-dotenv==1.2.3
+pydantic==2.13.5
+
+llama-index-core
+llama-index-embeddings-openai
+llama-index-llms-openai
+llama-index-vector-stores-pinecone
+llama-index-retrievers-bm25
+llama-cloud-services
+
+pinecone[grpc]==5.1.0
+
+transformers==5.17.0

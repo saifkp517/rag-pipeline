@@ -1,0 +1,8 @@
+client
+venv
+knowledge-base
+.git
+.claude
+**/__pycache__
+**/*.pyc
+.env
