@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 const links = [
-  { href: "/upload", label: "Upload" },
+  { href: "/dashboard", label: "Dashboard" },
   { href: "/chat", label: "Chat" },
 ];
 
@@ -13,8 +13,8 @@ export default function Nav() {
 
   return (
     <header className="sticky top-0 z-10 border-b border-slate-200/80 bg-white/80 backdrop-blur-sm">
-      <div className="mx-auto flex max-w-3xl items-center justify-between px-4 py-3">
-        <Link href="/chat" className="flex items-center gap-2">
+      <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
+        <Link href="/dashboard" className="flex items-center gap-2">
           <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-to-br from-teal-500 to-violet-600 text-sm font-bold text-white shadow-sm">
             R
           </span>

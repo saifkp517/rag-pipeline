@@ -1,7 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { streamChat } from "@/lib/api";
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useRef, useState } from "react";
+import { ApiError, getBot, streamChat, type Bot } from "@/lib/api";
 
 interface Message {
   id: string;
@@ -11,6 +13,17 @@ interface Message {
 }
 
 export default function ChatPage() {
+  return (
+    <Suspense fallback={null}>
+      <ChatView />
+    </Suspense>
+  );
+}
+
+function ChatView() {
+  const botSlug = useSearchParams().get("bot");
+  const [bot, setBot] = useState<Bot | null>(null);
+  const [botError, setBotError] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
@@ -18,12 +31,26 @@ export default function ChatPage() {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    if (!botSlug) return;
+    setBot(null);
+    setBotError(null);
+    setMessages([]);
+    sessionIdRef.current = undefined;
+
+    getBot(botSlug)
+      .then(setBot)
+      .catch((err) =>
+        setBotError(err instanceof ApiError ? err.message : "Bot not found.")
+      );
+  }, [botSlug]);
+
+  useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
   async function handleSend() {
     const text = input.trim();
-    if (!text || isStreaming) return;
+    if (!text || isStreaming || !bot) return;
 
     setInput("");
     setMessages((prev) => [
@@ -31,21 +58,18 @@ export default function ChatPage() {
       { id: crypto.randomUUID(), role: "user", content: text },
     ]);
 
-    const botId = crypto.randomUUID();
-    setMessages((prev) => [
-      ...prev,
-      { id: botId, role: "bot", content: "" },
-    ]);
+    const replyId = crypto.randomUUID();
+    setMessages((prev) => [...prev, { id: replyId, role: "bot", content: "" }]);
     setIsStreaming(true);
 
     try {
-      for await (const event of streamChat(text, sessionIdRef.current)) {
+      for await (const event of streamChat(text, bot.id, sessionIdRef.current)) {
         if (event.type === "session") {
           sessionIdRef.current = event.sessionId;
         } else if (event.type === "token") {
           setMessages((prev) =>
             prev.map((m) =>
-              m.id === botId ? { ...m, content: m.content + event.token } : m
+              m.id === replyId ? { ...m, content: m.content + event.token } : m
             )
           );
         } else if (event.type === "done") {
@@ -55,12 +79,11 @@ export default function ChatPage() {
     } catch {
       setMessages((prev) =>
         prev.map((m) =>
-          m.id === botId
+          m.id === replyId
             ? {
                 ...m,
                 content:
-                  m.content ||
-                  "Something went wrong while getting a response.",
+                  m.content || "Something went wrong while getting a response.",
                 error: true,
               }
             : m
@@ -71,17 +94,42 @@ export default function ChatPage() {
     }
   }
 
+  if (!botSlug || botError) {
+    return (
+      <main className="mx-auto flex w-full max-w-3xl flex-1 flex-col items-center justify-center gap-3 px-4 py-6 text-center">
+        <p className="text-sm text-slate-500">
+          {botError ?? "Pick a bot to start chatting."}
+        </p>
+        <Link
+          href="/dashboard"
+          className="rounded-lg bg-teal-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-500"
+        >
+          Go to dashboard
+        </Link>
+      </main>
+    );
+  }
+
   return (
     <main className="mx-auto flex w-full max-w-3xl flex-1 flex-col px-4 py-6">
       <div className="flex-1 space-y-5 overflow-y-auto pb-4">
         {messages.length === 0 && (
           <div className="flex h-full flex-col items-center justify-center gap-3 pt-16 text-center">
             <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-teal-500 to-violet-600 text-lg font-bold text-white shadow-sm">
-              R
+              {bot ? bot.name.charAt(0).toUpperCase() : "R"}
             </div>
-            <p className="text-sm text-slate-500">
-              Ask a question about your uploaded documents.
+            <p className="text-sm font-medium text-slate-900">
+              {bot?.name ?? "Loading..."}
             </p>
+            {bot && (
+              <p className="text-sm text-slate-500">
+                {bot.documents.length > 0
+                  ? `Drawing on ${bot.documents.length} document${
+                      bot.documents.length === 1 ? "" : "s"
+                    }.`
+                  : "No documents assigned - answers come from its prompt alone."}
+              </p>
+            )}
           </div>
         )}
         {messages.map((message) => (
@@ -98,7 +146,9 @@ export default function ChatPage() {
                   : "bg-gradient-to-br from-teal-500 to-violet-600 text-white"
               }`}
             >
-              {message.role === "user" ? "You" : "R"}
+              {message.role === "user"
+                ? "You"
+                : (bot?.name.charAt(0).toUpperCase() ?? "R")}
             </div>
             <div
               className={`max-w-[75%] whitespace-pre-wrap rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
@@ -132,13 +182,13 @@ export default function ChatPage() {
               handleSend();
             }
           }}
-          disabled={isStreaming}
-          placeholder="Type a message..."
+          disabled={isStreaming || !bot}
+          placeholder={bot ? `Message ${bot.name}...` : "Loading bot..."}
           className="flex-1 bg-transparent px-3 py-2 text-sm text-slate-900 outline-none placeholder:text-slate-400 disabled:opacity-60"
         />
         <button
           onClick={handleSend}
-          disabled={isStreaming || !input.trim()}
+          disabled={isStreaming || !input.trim() || !bot}
           className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-teal-600 text-white transition-colors hover:bg-teal-500 disabled:cursor-not-allowed disabled:bg-slate-300"
           aria-label="Send message"
         >

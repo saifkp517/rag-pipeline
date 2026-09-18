@@ -2,23 +2,36 @@ export const API_URL =
   process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 export interface UploadResponse {
+  id: string;
   filename: string;
   nodes_created: number;
 }
 
+export interface DocumentSummary {
+  id: string;
+  filename: string;
+  uploaded_at: string;
+  node_count: number;
+  status: "processing" | "ready" | "failed";
+}
+
+export interface Bot {
+  id: string;
+  slug: string;
+  name: string;
+  system_prompt: string;
+  guardrails: Record<string, unknown>;
+  created_at: string;
+  documents: DocumentSummary[];
+}
+
 export class ApiError extends Error {}
 
-export async function uploadDocument(file: File): Promise<UploadResponse> {
-  const formData = new FormData();
-  formData.append("file", file);
-
-  const res = await fetch(`${API_URL}/documents/upload`, {
-    method: "POST",
-    body: formData,
-  });
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${API_URL}${path}`, init);
 
   if (!res.ok) {
-    let detail = `Upload failed (${res.status})`;
+    let detail = `Request failed (${res.status})`;
     try {
       const body = await res.json();
       if (body?.detail) detail = body.detail;
@@ -31,6 +44,62 @@ export async function uploadDocument(file: File): Promise<UploadResponse> {
   return res.json();
 }
 
+export function uploadDocument(file: File): Promise<UploadResponse> {
+  const formData = new FormData();
+  formData.append("file", file);
+  return request<UploadResponse>("/documents/upload", {
+    method: "POST",
+    body: formData,
+  });
+}
+
+export function listDocuments(): Promise<DocumentSummary[]> {
+  return request<DocumentSummary[]>("/documents");
+}
+
+export function deleteDocument(id: string): Promise<unknown> {
+  return request(`/documents/${id}`, { method: "DELETE" });
+}
+
+export function listBots(): Promise<Bot[]> {
+  return request<Bot[]>("/bots");
+}
+
+export function getBot(idOrSlug: string): Promise<Bot> {
+  return request<Bot>(`/bots/${idOrSlug}`);
+}
+
+export function createBot(input: {
+  name: string;
+  system_prompt: string;
+  document_ids: string[];
+}): Promise<Bot> {
+  return request<Bot>("/bots", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateBot(
+  id: string,
+  input: {
+    name?: string;
+    system_prompt?: string;
+    document_ids?: string[];
+  }
+): Promise<Bot> {
+  return request<Bot>(`/bots/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteBot(id: string): Promise<unknown> {
+  return request(`/bots/${id}`, { method: "DELETE" });
+}
+
 export type ChatStreamEvent =
   | { type: "session"; sessionId: string }
   | { type: "token"; token: string }
@@ -38,6 +107,7 @@ export type ChatStreamEvent =
 
 export async function* streamChat(
   message: string,
+  botId: string,
   sessionId: string | undefined,
   signal?: AbortSignal
 ): AsyncGenerator<ChatStreamEvent> {
@@ -46,6 +116,7 @@ export async function* streamChat(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       message,
+      bot_id: botId,
       ...(sessionId ? { session_id: sessionId } : {}),
     }),
     signal,

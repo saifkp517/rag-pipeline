@@ -3,6 +3,7 @@ uvicorn[standard]==0.53.0
 python-multipart==0.0.32
 python-dotenv==1.2.3
 pydantic==2.13.5
+psycopg[binary,pool]==3.2.3
 
 llama-index-core
 llama-index-embeddings-openai
