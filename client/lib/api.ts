@@ -25,6 +25,23 @@ export interface Bot {
   documents: DocumentSummary[];
 }
 
+/** One conversation with a bot. Active until 24h after its last message. */
+export interface ChatSession {
+  id: string;
+  created_at: string;
+  last_message_at: string;
+  active: boolean;
+  message_count: number;
+  preview: string | null;
+}
+
+export interface StoredMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  created_at: string;
+}
+
 export class ApiError extends Error {}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -98,6 +115,20 @@ export function updateBot(
 
 export function deleteBot(id: string): Promise<unknown> {
   return request(`/bots/${id}`, { method: "DELETE" });
+}
+
+export function listSessions(botId: string): Promise<ChatSession[]> {
+  return request<ChatSession[]>(`/bots/${botId}/sessions`);
+}
+
+export function listSessionMessages(
+  sessionId: string
+): Promise<StoredMessage[]> {
+  return request<StoredMessage[]>(`/sessions/${sessionId}/messages`);
+}
+
+export function deleteSession(sessionId: string): Promise<unknown> {
+  return request(`/sessions/${sessionId}`, { method: "DELETE" });
 }
 
 export type ChatStreamEvent =

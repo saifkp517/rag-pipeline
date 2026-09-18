@@ -2,7 +2,6 @@ import json
 import os
 import sys
 import tempfile
-import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -13,7 +12,7 @@ from starlette.concurrency import run_in_threadpool
 
 import guardrails
 import registry
-from chat_engine import forget_bot, stream_turn
+from chat_engine import stream_turn
 
 # ingest.py lives in the sibling info-processing/ directory, not a
 # separate installed package, so it has to be added to the import path.
@@ -69,7 +68,10 @@ async def chat_stream(req: ChatRequest):
     if bot is None:
         raise HTTPException(status_code=404, detail="Bot not found")
 
-    session_id = req.session_id or str(uuid.uuid4())
+    # Continues the caller's conversation if it is still inside the 24-hour
+    # window, otherwise starts a new one and leaves the old one in place.
+    # The client learns which it got from the session event below.
+    session_id = registry.resolve_session(bot["id"], req.session_id)
     refusal = guardrails.check_message(
         guardrails.normalize(bot["guardrails"]), req.message
     )
@@ -78,6 +80,10 @@ async def chat_stream(req: ChatRequest):
         yield f"event: session\ndata: {json.dumps({'session_id': session_id})}\n\n"
 
         if refusal:
+            # Stored like any other turn so a blocked message is visible in
+            # the transcript rather than silently missing from it.
+            registry.append_message(session_id, "user", req.message)
+            registry.append_message(session_id, "assistant", refusal)
             yield f"data: {json.dumps({'token': refusal})}\n\n"
             yield "event: done\ndata: {}\n\n"
             return
@@ -183,9 +189,32 @@ async def patch_bot(bot_id: str, req: BotUpdateRequest):
 
 @app.delete("/bots/{bot_id}")
 async def remove_bot(bot_id: str):
-    # Only the bot and its document assignments go; documents are shared
-    # with other bots and stay in the registry and in Pinecone.
+    # Document assignments, conversations and their messages all cascade
+    # from this row. The documents themselves are shared with other bots and
+    # stay in the registry and in Pinecone.
     if not registry.delete_bot(bot_id):
         raise HTTPException(status_code=404, detail="Bot not found")
-    forget_bot(bot_id)
     return {"id": bot_id}
+
+
+@app.get("/bots/{bot_id}/sessions")
+async def get_bot_sessions(bot_id: str):
+    bot = registry.get_bot(bot_id)
+    if bot is None:
+        raise HTTPException(status_code=404, detail="Bot not found")
+    return registry.list_sessions(bot["id"])
+
+
+@app.get("/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str):
+    messages = registry.list_messages(session_id)
+    if messages is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return messages
+
+
+@app.delete("/sessions/{session_id}")
+async def remove_session(session_id: str):
+    if not registry.delete_session(session_id):
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"id": session_id}

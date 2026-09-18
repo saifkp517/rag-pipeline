@@ -55,7 +55,40 @@ CREATE TABLE IF NOT EXISTS bot_documents (
     document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     PRIMARY KEY (bot_id, document_id)
 );
+
+-- A conversation. There is no explicit open/closed column: a session is
+-- active while last_message_at is inside SESSION_WINDOW, and expiry is
+-- evaluated when the next message arrives rather than by a background job.
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id              UUID PRIMARY KEY,
+    bot_id          UUID        NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_message_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS chat_sessions_bot_idx
+    ON chat_sessions (bot_id, last_message_at DESC);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id         BIGSERIAL   PRIMARY KEY,
+    session_id UUID        NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    role       TEXT        NOT NULL,
+    content    TEXT        NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS chat_messages_session_idx
+    ON chat_messages (session_id, id);
 """
+
+# How long a conversation stays open after its most recent message. Held as
+# a literal because it is interpolated into an interval, never user input.
+SESSION_WINDOW = "24 hours"
+
+
+def _active_clause(prefix: str = "") -> str:
+    """SQL predicate for 'this conversation is still open'."""
+    return f"{prefix}last_message_at > now() - interval '{SESSION_WINDOW}'"
 
 
 def init_schema() -> None:
@@ -214,6 +247,119 @@ def bot_document_ids(bot_id: str) -> list[str]:
     return [str(row["document_id"]) for row in rows]
 
 
+# --- chat sessions -----------------------------------------------------
+
+
+def resolve_session(bot_id: str, session_id: str | None) -> str:
+    """Return the session a new message belongs to, creating one if needed.
+
+    The caller's session is reused only while it is still inside the active
+    window; once it has expired the old conversation is left untouched for
+    history and a fresh one is started. This is the only place the 24-hour
+    rule is enforced, so no sweeper job is needed.
+    """
+    with _pool.connection() as conn, conn.transaction():
+        if session_id:
+            # id::text avoids a cast error when a client sends a stale or
+            # malformed id rather than a UUID.
+            row = conn.execute(
+                "SELECT id FROM chat_sessions"
+                f" WHERE id::text = %s AND bot_id = %s AND {_active_clause()}",
+                (session_id, bot_id),
+            ).fetchone()
+            if row is not None:
+                return str(row["id"])
+
+        new_session_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO chat_sessions (id, bot_id) VALUES (%s, %s)",
+            (new_session_id, bot_id),
+        )
+        return new_session_id
+
+
+def append_message(session_id: str, role: str, content: str) -> None:
+    """Store one message and extend the session's active window."""
+    with _pool.connection() as conn, conn.transaction():
+        conn.execute(
+            "INSERT INTO chat_messages (session_id, role, content)"
+            " VALUES (%s, %s, %s)",
+            (session_id, role, content),
+        )
+        conn.execute(
+            "UPDATE chat_sessions SET last_message_at = now() WHERE id = %s",
+            (session_id,),
+        )
+
+
+def session_history(session_id: str, limit: int = 50) -> list[dict[str, str]]:
+    """Return the most recent messages of a session, oldest first.
+
+    Bounded so a long conversation doesn't grow the per-turn query without
+    limit; the chat memory trims to its token budget on top of this.
+    """
+    with _pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM ("
+            "  SELECT id, role, content FROM chat_messages"
+            "  WHERE session_id = %s ORDER BY id DESC LIMIT %s"
+            ") recent ORDER BY id",
+            (session_id, limit),
+        ).fetchall()
+    return [{"role": row["role"], "content": row["content"]} for row in rows]
+
+
+def list_sessions(bot_id: str) -> list[dict[str, Any]]:
+    with _pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT s.id, s.created_at, s.last_message_at,"
+            f"       ({_active_clause('s.')}) AS active,"
+            "       (SELECT count(*) FROM chat_messages m"
+            "         WHERE m.session_id = s.id) AS message_count,"
+            "       (SELECT m.content FROM chat_messages m"
+            "         WHERE m.session_id = s.id AND m.role = 'user'"
+            "         ORDER BY m.id LIMIT 1) AS preview"
+            " FROM chat_sessions s WHERE s.bot_id = %s"
+            " ORDER BY s.last_message_at DESC",
+            (bot_id,),
+        ).fetchall()
+    return [_serialize_session(row) for row in rows]
+
+
+def list_messages(session_id: str) -> list[dict[str, Any]] | None:
+    """Full transcript of one session, or None when it doesn't exist."""
+    with _pool.connection() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM chat_sessions WHERE id::text = %s", (session_id,)
+        ).fetchone()
+        if exists is None:
+            return None
+
+        rows = conn.execute(
+            "SELECT id, role, content, created_at FROM chat_messages"
+            " WHERE session_id = %s ORDER BY id",
+            (session_id,),
+        ).fetchall()
+    return [
+        {
+            "id": str(row["id"]),
+            "role": row["role"],
+            "content": row["content"],
+            "created_at": row["created_at"].isoformat(),
+        }
+        for row in rows
+    ]
+
+
+def delete_session(session_id: str) -> bool:
+    with _pool.connection() as conn:
+        # Messages cascade from the session row.
+        result = conn.execute(
+            "DELETE FROM chat_sessions WHERE id::text = %s", (session_id,)
+        )
+    return result.rowcount > 0
+
+
 # --- helpers -----------------------------------------------------------
 
 
@@ -255,6 +401,17 @@ def _serialize_document(row: dict[str, Any]) -> dict[str, Any]:
         "uploaded_at": row["uploaded_at"].isoformat(),
         "node_count": row["node_count"],
         "status": row["status"],
+    }
+
+
+def _serialize_session(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "created_at": row["created_at"].isoformat(),
+        "last_message_at": row["last_message_at"].isoformat(),
+        "active": row["active"],
+        "message_count": row["message_count"],
+        "preview": row["preview"],
     }
 
 

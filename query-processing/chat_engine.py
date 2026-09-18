@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Iterator, List
 
 from dotenv import load_dotenv
 from llama_index.core.base.llms.types import ChatMessage, MessageRole
@@ -10,6 +10,7 @@ from llama_index.core.schema import NodeWithScore, QueryBundle
 from llama_index.llms.openai import OpenAI
 
 import guardrails
+import registry
 from hybrid_retriever import HybridRetriever
 
 load_dotenv()
@@ -20,9 +21,7 @@ NO_CONTEXT_MESSAGE = (
     "I couldn't find anything relevant to that in the documents assigned to me."
 )
 
-# Only conversation memory is per-session. In-memory dict for now -
-# sessions are lost on restart and don't survive multiple server processes.
-_memories: Dict[Tuple[str, str], ChatMemoryBuffer] = {}
+MEMORY_TOKEN_LIMIT = 3000
 
 
 class _PrefetchedRetriever(BaseRetriever):
@@ -43,17 +42,43 @@ class _PrefetchedRetriever(BaseRetriever):
 def stream_turn(bot: dict[str, Any], session_id: str, message: str) -> Iterator[str]:
     """Run one chat turn for a bot, yielding response tokens.
 
+    Postgres is the conversation's source of truth: prior messages are read
+    back into a throwaway memory buffer at the start of the turn and both
+    sides of the exchange are written at the end. Nothing is cached between
+    turns, so history survives restarts and extra worker processes.
+    """
+    memory = ChatMemoryBuffer.from_defaults(
+        token_limit=MEMORY_TOKEN_LIMIT,
+        chat_history=[
+            ChatMessage(role=MessageRole(entry["role"]), content=entry["content"])
+            for entry in registry.session_history(session_id)
+        ],
+    )
+    registry.append_message(session_id, MessageRole.USER.value, message)
+
+    reply = ""
+    try:
+        for token in _generate(bot, memory, message):
+            reply += token
+            yield token
+    finally:
+        # In a finally so a client that disconnects mid-stream still leaves a
+        # stored answer rather than a user message with nothing beside it.
+        if reply:
+            registry.append_message(session_id, MessageRole.ASSISTANT.value, reply)
+
+
+def _generate(
+    bot: dict[str, Any], memory: ChatMemoryBuffer, message: str
+) -> Iterator[str]:
+    """Produce the reply tokens for one turn.
+
     Retrieval is done here rather than inside the chat engine because
     llama-index's synthesizer answers the literal string "Empty Response"
     when handed zero nodes - it never reaches the LLM, so the bot's system
     prompt is ignored. The two empty cases are meaningfully different and
     are handled separately below.
     """
-    key = (bot["id"], session_id)
-    if key not in _memories:
-        _memories[key] = ChatMemoryBuffer.from_defaults(token_limit=3000)
-    memory = _memories[key]
-
     rules = guardrails.normalize(bot.get("guardrails"))
     system_prompt = bot["system_prompt"] + guardrails.system_prompt_suffix(rules)
     document_ids = [doc["id"] for doc in bot["documents"]]
@@ -66,8 +91,6 @@ def stream_turn(bot: dict[str, Any], session_id: str, message: str) -> Iterator[
 
     nodes = HybridRetriever(document_ids).retrieve(message)
     if not nodes:
-        memory.put(ChatMessage(role=MessageRole.USER, content=message))
-        memory.put(ChatMessage(role=MessageRole.ASSISTANT, content=NO_CONTEXT_MESSAGE))
         yield NO_CONTEXT_MESSAGE
         return
 
@@ -83,21 +106,11 @@ def stream_turn(bot: dict[str, Any], session_id: str, message: str) -> Iterator[
 def _stream_without_context(
     memory: ChatMemoryBuffer, system_prompt: str, message: str
 ) -> Iterator[str]:
-    memory.put(ChatMessage(role=MessageRole.USER, content=message))
     messages = [
         ChatMessage(role=MessageRole.SYSTEM, content=system_prompt),
         *memory.get_all(),
+        ChatMessage(role=MessageRole.USER, content=message),
     ]
 
-    reply = ""
     for chunk in _llm.stream_chat(messages):
-        delta = chunk.delta or ""
-        reply += delta
-        yield delta
-
-    memory.put(ChatMessage(role=MessageRole.ASSISTANT, content=reply))
-
-
-def forget_bot(bot_id: str) -> None:
-    for key in [key for key in _memories if key[0] == bot_id]:
-        del _memories[key]
+        yield chunk.delta or ""
