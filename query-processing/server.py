@@ -13,6 +13,7 @@ from starlette.concurrency import run_in_threadpool
 import guardrails
 import registry
 from chat_engine import stream_turn
+from guardrails import Guardrails
 
 # ingest.py lives in the sibling info-processing/ directory, not a
 # separate installed package, so it has to be added to the import path.
@@ -52,14 +53,14 @@ class BotCreateRequest(BaseModel):
     name: str
     system_prompt: str
     document_ids: list[str] = []
-    guardrails: dict | None = None
+    guardrails: Guardrails | None = None
 
 
 class BotUpdateRequest(BaseModel):
     name: str | None = None
     system_prompt: str | None = None
     document_ids: list[str] | None = None
-    guardrails: dict | None = None
+    guardrails: Guardrails | None = None
 
 
 @app.post("/chat/stream")
